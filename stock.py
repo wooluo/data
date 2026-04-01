@@ -19,13 +19,23 @@ STOCKS = [
     }
 ]
 
-# 请求头
+# 请求头 - 模拟浏览器请求
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    "Referer": "https://quote.eastmoney.com/",
-    "Origin": "https://quote.eastmoney.com",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,zh-TW;q=0.7",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "Pragma": "no-cache",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+    "sec-ch-Ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+    "sec-Ch-Ua-Mobile": "?0",
+    "sec-Ch-Ua-Platform": '"macOS"',
 }
 
 
@@ -42,7 +52,6 @@ def get_kline_data_eastmoney(stock, retry=3):
         "beg": "20100101",
         "end": end_date,
         "lmt": 5000,
-        "ut": "b2884a393a59ad64002292a3e90d46a5",
     }
 
     url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
@@ -73,13 +82,12 @@ def get_kline_data_eastmoney(stock, retry=3):
 
 def get_kline_data_sina(stock, retry=3):
     """使用新浪API获取K线数据（备用）"""
-    # 新浪财经API
     symbol = f"sh{stock['code']}" if stock['market'] == 'sh' else f"sz{stock['code']}"
-    url = f"https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData"
+    url = "https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData"
 
     params = {
         "symbol": symbol,
-        "scale": 240,  # 日K
+        "scale": 240,
         "ma": "no",
         "datalen": 5000
     }
