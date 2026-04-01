@@ -2,45 +2,57 @@ import json
 import time
 import requests
 from datetime import datetime
+from urllib.parse import urlencode
 
 # 股票配置
 STOCKS = [
     {
         "name": "风范股份",
         "code": "601700",
-        "secid": "1.601700",  # 沪股
+        "secid": "1.601700",
         "market": "sh"
     },
     {
         "name": "浙江世宝",
         "code": "002703",
-        "secid": "0.002703",  # 深股
+        "secid": "0.002703",
         "market": "sz"
     }
 ]
 
-# 请求头 - 模拟浏览器请求
+# 创建全局session
+session = requests.Session()
+
+# 请求头
 HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br, zstd",
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,zh-TW;q=0.7",
-    "Cache-Control": "no-cache",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
-    "Pragma": "no-cache",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
     "Upgrade-Insecure-Requests": "1",
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-    "sec-ch-Ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
-    "sec-Ch-Ua-Mobile": "?0",
-    "sec-Ch-Ua-Platform": '"macOS"',
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
 }
 
 
-def get_kline_data_eastmoney(stock, retry=3):
-    """使用东方财富API获取K线数据"""
+def init_session():
+    """初始化session，访问页面获取cookie"""
+    try:
+        # 访问东方财富首页获取cookie
+        session.get("https://www.eastmoney.com/", headers=HEADERS, timeout=30)
+        time.sleep(0.5)
+        # 访问行情页面
+        session.get("https://quote.eastmoney.com/", headers=HEADERS, timeout=30)
+        time.sleep(0.5)
+        return True
+    except Exception as e:
+        print(f"初始化session失败: {e}")
+        return False
+
+
+def get_kline_data(stock, retry=3):
+    """获取K线数据"""
     end_date = datetime.now().strftime("%Y%m%d")
 
     params = {
@@ -52,67 +64,43 @@ def get_kline_data_eastmoney(stock, retry=3):
         "beg": "20100101",
         "end": end_date,
         "lmt": 5000,
+        "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+        "_": str(int(time.time() * 1000))
     }
 
     url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 
+    api_headers = HEADERS.copy()
+    api_headers["Referer"] = "https://quote.eastmoney.com/"
+    api_headers["Accept"] = "*/*"
+
     for attempt in range(retry):
         try:
-            response = requests.get(
+            response = session.get(
                 url,
                 params=params,
-                headers=HEADERS,
+                headers=api_headers,
                 timeout=60
             )
             response.raise_for_status()
             data = response.json()
 
             if data.get("data") and data["data"].get("klines"):
-                return parse_klines(data, stock)
-            else:
-                print(f"  尝试 {attempt + 1}: 无数据返回")
-                if attempt < retry - 1:
-                    time.sleep(2)
-        except Exception as e:
-            print(f"  尝试 {attempt + 1} 失败: {e}")
-            if attempt < retry - 1:
-                time.sleep(3)
-    return None
-
-
-def get_kline_data_sina(stock, retry=3):
-    """使用新浪API获取K线数据（备用）"""
-    symbol = f"sh{stock['code']}" if stock['market'] == 'sh' else f"sz{stock['code']}"
-    url = "https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData"
-
-    params = {
-        "symbol": symbol,
-        "scale": 240,
-        "ma": "no",
-        "datalen": 5000
-    }
-
-    for attempt in range(retry):
-        try:
-            response = requests.get(
-                url,
-                params=params,
-                headers={"User-Agent": HEADERS["User-Agent"]},
-                timeout=60
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            if data and isinstance(data, list):
                 klines = []
-                for item in data:
+                for line in data["data"]["klines"]:
+                    parts = line.split(",")
                     klines.append({
-                        "date": item.get("day", ""),
-                        "open": float(item.get("open", 0)),
-                        "close": float(item.get("close", 0)),
-                        "high": float(item.get("high", 0)),
-                        "low": float(item.get("low", 0)),
-                        "volume": float(item.get("volume", 0)),
+                        "date": parts[0],
+                        "open": float(parts[1]),
+                        "close": float(parts[2]),
+                        "high": float(parts[3]),
+                        "low": float(parts[4]),
+                        "volume": float(parts[5]),
+                        "amount": float(parts[6]),
+                        "amplitude": float(parts[7]),
+                        "change_pct": float(parts[8]),
+                        "change": float(parts[9]),
+                        "turnover": float(parts[10])
                     })
                 return {
                     "name": stock["name"],
@@ -122,60 +110,24 @@ def get_kline_data_sina(stock, retry=3):
                     "klines": klines
                 }
             else:
-                print(f"  新浪尝试 {attempt + 1}: 无数据返回")
+                print(f"  尝试 {attempt + 1}: 无数据返回")
                 if attempt < retry - 1:
                     time.sleep(2)
         except Exception as e:
-            print(f"  新浪尝试 {attempt + 1} 失败: {e}")
+            print(f"  尝试 {attempt + 1} 失败: {e}")
             if attempt < retry - 1:
+                # 重新初始化session
+                init_session()
                 time.sleep(3)
-    return None
-
-
-def parse_klines(data, stock):
-    """解析东方财富K线数据"""
-    klines = []
-    for line in data["data"]["klines"]:
-        parts = line.split(",")
-        klines.append({
-            "date": parts[0],
-            "open": float(parts[1]),
-            "close": float(parts[2]),
-            "high": float(parts[3]),
-            "low": float(parts[4]),
-            "volume": float(parts[5]),
-            "amount": float(parts[6]),
-            "amplitude": float(parts[7]),
-            "change_pct": float(parts[8]),
-            "change": float(parts[9]),
-            "turnover": float(parts[10])
-        })
-    return {
-        "name": stock["name"],
-        "code": stock["code"],
-        "market": stock["market"],
-        "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "klines": klines
-    }
-
-
-def get_kline_data(stock):
-    """获取K线数据，依次尝试多个数据源"""
-    print(f"  尝试东方财富API...")
-    data = get_kline_data_eastmoney(stock)
-    if data:
-        return data
-
-    print(f"  尝试新浪财经API...")
-    data = get_kline_data_sina(stock)
-    if data:
-        return data
-
     return None
 
 
 def main():
     """主函数"""
+    # 初始化session获取cookie
+    print("初始化连接...")
+    init_session()
+
     results = []
     for stock in STOCKS:
         print(f"正在获取 {stock['name']} 数据...")
@@ -187,7 +139,7 @@ def main():
             print(f"  成功: 获取 {len(data['klines'])} 条数据")
             results.append(stock['name'])
         else:
-            print(f"  失败: 所有数据源均无法获取")
+            print(f"  失败: 无法获取数据")
         time.sleep(1)
 
     if results:
