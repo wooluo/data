@@ -25,14 +25,22 @@ jobs:
         pip install -r requirements.txt
 
     - name: Update stock data
+      id: update
       run: |
         python stock.py | tee /tmp/update.log
+        # 检查是否有json文件生成
+        if ls *.json 1> /dev/null 2>&1; then
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+        else
+          echo "has_changes=false" >> $GITHUB_OUTPUT
+        fi
 
     - name: Commit and push if changed
+      if: steps.update.outputs.has_changes == 'true'
       run: |
         git config --global user.email "stock-bot"
         git config --global user.name "stock-bot"
         git add *.json
         MESSAGE=$(cat /tmp/update.log)
-        git diff-index --quiet HEAD || git commit -m "$MESSAGE"
+        git diff --staged --quiet || git commit -m "$MESSAGE"
         git push
