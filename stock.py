@@ -1,4 +1,5 @@
 import json
+import time
 import requests
 from datetime import datetime
 
@@ -26,8 +27,25 @@ BEG = "20100101"
 END = datetime.now().strftime("%Y%m%d")
 LMT = 5000  # 获取数据条数
 
+# 请求头
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+    "Accept": "*/*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://quote.eastmoney.com/",
+    "Origin": "https://quote.eastmoney.com",
+    "Connection": "keep-alive",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
+    "Sec-Ch-Ua": '"Chromium";v="130", "Microsoft Edge";v="130", "Not?A_Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+}
 
-def get_kline_data(stock):
+
+def get_kline_data(stock, retry=3):
     """获取单只股票的K线数据"""
     params = {
         "secid": stock["secid"],
@@ -37,50 +55,61 @@ def get_kline_data(stock):
         "fqt": FQT,
         "beg": BEG,
         "end": END,
-        "lmt": LMT
+        "lmt": LMT,
+        "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+        "cb": "",
+        "_": str(int(time.time() * 1000))
     }
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-        "Referer": "https://quote.eastmoney.com/",
-    }
+    for attempt in range(retry):
+        try:
+            response = requests.get(
+                BASE_URL,
+                params=params,
+                headers=HEADERS,
+                timeout=60,
+                verify=True
+            )
+            response.raise_for_status()
+            data = response.json()
 
-    try:
-        response = requests.get(BASE_URL, params=params, headers=headers, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-
-        if data.get("data") and data["data"].get("klines"):
-            klines = []
-            for line in data["data"]["klines"]:
-                # 数据格式: 日期,开盘,收盘,最高,最低,成交量,成交额,振幅,涨跌幅,涨跌额,换手率
-                parts = line.split(",")
-                klines.append({
-                    "date": parts[0],
-                    "open": float(parts[1]),
-                    "close": float(parts[2]),
-                    "high": float(parts[3]),
-                    "low": float(parts[4]),
-                    "volume": float(parts[5]),
-                    "amount": float(parts[6]),
-                    "amplitude": float(parts[7]),
-                    "change_pct": float(parts[8]),
-                    "change": float(parts[9]),
-                    "turnover": float(parts[10])
-                })
-            return {
-                "name": stock["name"],
-                "code": stock["secid"].split(".")[1],
-                "market": stock["market"],
-                "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "klines": klines
-            }
-        else:
-            print(f"获取 {stock['name']} 数据失败: 无数据返回")
-            return None
-    except Exception as e:
-        print(f"获取 {stock['name']} 数据出错: {e}")
-        return None
+            if data.get("data") and data["data"].get("klines"):
+                klines = []
+                for line in data["data"]["klines"]:
+                    parts = line.split(",")
+                    klines.append({
+                        "date": parts[0],
+                        "open": float(parts[1]),
+                        "close": float(parts[2]),
+                        "high": float(parts[3]),
+                        "low": float(parts[4]),
+                        "volume": float(parts[5]),
+                        "amount": float(parts[6]),
+                        "amplitude": float(parts[7]),
+                        "change_pct": float(parts[8]),
+                        "change": float(parts[9]),
+                        "turnover": float(parts[10])
+                    })
+                return {
+                    "name": stock["name"],
+                    "code": stock["secid"].split(".")[1],
+                    "market": stock["market"],
+                    "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "klines": klines
+                }
+            else:
+                print(f"获取 {stock['name']} 数据失败: 无数据返回")
+                if attempt < retry - 1:
+                    time.sleep(2)
+                    continue
+                return None
+        except Exception as e:
+            print(f"获取 {stock['name']} 数据出错 (尝试 {attempt + 1}/{retry}): {e}")
+            if attempt < retry - 1:
+                time.sleep(3)
+            else:
+                return None
+    return None
 
 
 def main():
@@ -90,12 +119,12 @@ def main():
         print(f"正在获取 {stock['name']} 数据...")
         data = get_kline_data(stock)
         if data:
-            # 保存单只股票数据
             filename = f"{stock['name']}.json"
             with open(filename, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             print(f"{stock['name']}: 获取 {len(data['klines'])} 条数据")
             results.append(stock['name'])
+        time.sleep(1)  # 请求间隔
 
     if results:
         print(f"更新完成: {', '.join(results)}")
