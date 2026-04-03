@@ -620,13 +620,22 @@ class WyckoffAnalyzer:
         if has_support_test:
             score += 5
 
-        # === 分级标准 ===
-        # A级：分数>=80 + 量比3-5 + 涨幅>=7% + 结构确认
+        # === 分级标准（V11: 增加主力资金校验）===
+        # A级：分数>=80 + 量比3-5 + 涨幅>=7% + 结构确认 + 主力资金>=5%
         quality = 'C'
         if (score >= 80 and 3 <= volume_ratio <= 5 and change_pct >= 7 and has_support_test):
             quality = 'A'
         elif score >= 65 and volume_ratio >= 3 and change_pct >= 5:
             quality = 'B'
+
+        # === 主力资金降级机制 ===
+        # 注：主力资金数据需要额外获取，这里用简化逻辑
+        # 实际应用中应接入资金流向API
+        main_inflow_ratio = self._estimate_main_inflow(change_pct, volume_ratio, is_weak_market)
+
+        # 主力资金占比<5%降级
+        if main_inflow_ratio < self.config.min_main_inflow_ratio and quality == 'A':
+            quality = 'B'  # A级降为B级
 
         return {
             'is_sos': True,
@@ -638,7 +647,37 @@ class WyckoffAnalyzer:
             'wyckoff_phase': wyckoff_phase,
             'support_confirmed': has_support_test,
             'health_check': change_pct >= min_required_change,
+            'main_inflow_est': round(main_inflow_ratio, 1),
         }
+
+    def _estimate_main_inflow(self, change_pct: float, volume_ratio: float,
+                              is_weak_market: bool) -> float:
+        """估算主力资金占比（简化模型）
+        实际应用中应接入同花顺/东方财富资金流向API
+        """
+        # 基于量价关系估算主力资金
+        # 假设：涨停+高量比=主力介入概率高
+        base_ratio = 3.0  # 基准3%
+
+        # 涨幅加分
+        if change_pct >= 9.9:
+            base_ratio += 4  # 涨停+4%
+        elif change_pct >= 7:
+            base_ratio += 2.5
+        elif change_pct >= 5:
+            base_ratio += 1.5
+
+        # 量比修正（过高可能散户追涨）
+        if 3 <= volume_ratio <= 4:
+            base_ratio += 1.5  # 最佳区间
+        elif volume_ratio > 6:
+            base_ratio -= 1  # 过热，可能散户为主
+
+        # 弱市强势加分
+        if is_weak_market and change_pct > 5:
+            base_ratio += 1.5
+
+        return max(0, base_ratio)
 
     def _identify_wyckoff_phase(self, closes: np.ndarray, highs: np.ndarray,
                                 lows: np.ndarray, volumes: np.ndarray) -> str:
