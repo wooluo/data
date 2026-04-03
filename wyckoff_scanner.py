@@ -58,32 +58,47 @@ def setup_logging(log_level: str = "INFO") -> logging.Logger:
 
 @dataclass
 class ScannerConfig:
-    """扫描器配置 V9 - 专业优化版"""
+    """扫描器配置 V10 - 专业优化版"""
     max_workers: int = 2
     request_delay: float = 0.8
     request_timeout: int = 15
     request_retries: int = 3
 
-    # 基础过滤
+    # === 基础过滤 ===
     min_change_pct: float = 5.0
     min_price: float = 3.0
     max_price: float = 100.0
 
-    # 动态量比阈值（3-8范围）
+    # === 市值过滤（单位：亿）===
+    min_market_cap: float = 50.0    # 排除<50亿（流动性风险）
+    max_market_cap: float = 2000.0  # 排除>2000亿（弹性不足）
+
+    # === 换手率过滤 ===
+    min_turnover_rate: float = 3.0   # <3%流动性枯竭
+    max_turnover_rate: float = 20.0  # >20%短期投机
+
+    # === 量比阈值（3-8范围）===
     min_volume_ratio: float = 3.0
-    max_volume_ratio: float = 8.0  # 超过8视为异常
+    max_volume_ratio: float = 8.0
 
-    # 量价健康度：涨幅需 >= 量比 × health_factor
-    volume_price_health_factor: float = 1.5
+    # === 量价健康度 ===
+    volume_price_health_factor: float = 1.5  # 涨幅>=量比×1.5
 
-    # 弱市阈值
-    weak_market_threshold: float = -0.5  # 大盘跌0.5%以上视为弱市
-    weak_market_min_change: float = 7.0  # 弱市要求涨幅>7%
+    # === 弱市阈值 ===
+    weak_market_threshold: float = -0.5
+    weak_market_min_change: float = 7.0
 
-    # 行业强度
+    # === 行业强度 ===
     industry_top_percent: float = 30.0  # 只保留行业前30%
 
-    # 结构确认
+    # === 资金流向 ===
+    min_main_inflow_ratio: float = 5.0  # 主力净流入占比>=5%
+
+    # === 历史表现（防追高）===
+    max_5day_gain: float = 20.0       # 排除5日涨幅>20%
+    max_continuous_up_days: int = 3   # 排除连涨>3天
+
+    # === 结构确认 ===
     structure_confirm_days: int = 5
 
     cache_enabled: bool = True
@@ -252,14 +267,29 @@ class MultiSourceAPI:
                     try:
                         change_pct = float(item.get('changepercent', 0) or 0)
                         price = float(item.get('trade', 0) or 0)
-                        pe = float(item.get('per', 0) or 0)
+                        mktcap = float(item.get('mktcap', 0) or 0)  # 市值（万）
+                        turnover_rate = float(item.get('turnoverratio', 0) or 0)  # 换手率
                     except:
                         continue
 
+                    # 基础过滤
                     if change_pct < min_change:
                         continue
                     if price < self.config.min_price or price > self.config.max_price:
                         continue
+
+                    # 市值过滤（mktcap单位是万，转成亿）
+                    market_cap_yi = mktcap / 10000
+                    if market_cap_yi < self.config.min_market_cap:
+                        continue  # 排除小市值
+                    if market_cap_yi > self.config.max_market_cap:
+                        continue  # 排除超大市值
+
+                    # 换手率过滤
+                    if turnover_rate < self.config.min_turnover_rate:
+                        continue  # 流动性枯竭
+                    if turnover_rate > self.config.max_turnover_rate:
+                        continue  # 短期投机
 
                     stocks.append({
                         'code': code,
@@ -272,8 +302,9 @@ class MultiSourceAPI:
                         'high': float(item.get('high', 0) or 0),
                         'low': float(item.get('low', 0) or 0),
                         'settlement': float(item.get('settlement', 0) or 0),
-                        'per': pe,
-                        'nmc': float(item.get('nmc', 0) or 0),
+                        'per': float(item.get('per', 0) or 0),
+                        'mktcap': market_cap_yi,
+                        'turnover_rate': turnover_rate,
                     })
 
                 if len(data) < 100:
@@ -521,6 +552,11 @@ class WyckoffAnalyzer:
         # 结构确认
         has_support_test = self._check_support_structure(closes, lows, volumes)
 
+        # === 历史表现检测（防追高）===
+        history_ok, history_reason = self._check_history_performance(closes)
+        if not history_ok:
+            return None  # 排除追高风险
+
         # SOS信号判断
         is_sos = False
         signal_reason = []
@@ -665,6 +701,32 @@ class WyckoffAnalyzer:
                     support_tests += 1
 
         return support_tests >= 2  # 至少2次支撑测试
+
+    def _check_history_performance(self, closes: np.ndarray) -> Tuple[bool, str]:
+        """检测历史表现，规避追高风险"""
+        if len(closes) < 5:
+            return True, ""
+
+        # 计算5日涨幅
+        gain_5d = (closes[-1] - closes[-6]) / closes[-6] * 100 if len(closes) >= 6 else 0
+
+        # 排除5日涨幅>20%
+        if gain_5d > self.config.max_5day_gain:
+            return False, f"5日涨幅{gain_5d:.1f}%>{self.config.max_5day_gain}%"
+
+        # 检测连续上涨天数
+        continuous_up = 0
+        for i in range(-2, -min(len(closes), 6), -1):
+            if closes[i] > closes[i-1]:
+                continuous_up += 1
+            else:
+                break
+
+        # 排除连涨>3天
+        if continuous_up > self.config.max_continuous_up_days:
+            return False, f"连涨{continuous_up}天>{self.config.max_continuous_up_days}天"
+
+        return True, ""
 
 
 class WyckoffScanner:
