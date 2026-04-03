@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-威科夫SOS信号全市场扫描器 V5
-使用东方财富API， curl + ThreadPoolExecutor 实现并发
+威科夫SOS信号全市场扫描器 V6
+使用 requests.Session 模拟浏览器，带重试和会话保持
 
 策略增强：
 - 威科夫累积结构识别 (PS/SC/AR/ST)
@@ -16,7 +16,8 @@ import json
 import logging
 import os
 import pickle
-import subprocess
+import random
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,6 +28,9 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
 import numpy as np
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # 清除所有代理环境变量
 for proxy_var in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy']:
@@ -86,7 +90,8 @@ class ScannerConfig:
     """扫描器配置"""
     # 筛选条件
     min_change_pct: float = 2.0
-    max_pe: float = 200.0
+    max_pe: float = 500.0
+    allow_negative_pe: bool = True
     min_price: float = 3.0
     max_price: float = 300.0
 
@@ -109,13 +114,17 @@ class ScannerConfig:
     index_strength_threshold: float = 0.3
 
     # 网络配置
-    max_workers: int = 5
-    request_timeout: int = 15
-    request_delay: float = 0.15
+    max_workers: int = 3
+    request_timeout: int = 20
+    request_delay: float = 0.5
+    request_delay_jitter: float = 0.5
+
+    # Cookie配置（可选，一般不需要设置，除非遇到反爬限制）
+    cookie: str = ""
 
     # 缓存配置
     cache_enabled: bool = True
-    cache_ttl_hours: int = 4
+    cache_ttl_hours: int = 8
     cache_dir: Path = field(default_factory=lambda: Path.home() / ".openclaw/workspace/cache")
 
     # 输出配置
@@ -194,7 +203,7 @@ class SOSSignal:
 class DataCache:
     """数据缓存管理器"""
 
-    def __init__(self, cache_dir: Path, ttl_hours: int = 4):
+    def __init__(self, cache_dir: Path, ttl_hours: int = 8):
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.ttl_seconds = ttl_hours * 3600
@@ -542,6 +551,86 @@ class VolumePriceAnalyzer:
         return analysis
 
 
+class BrowserSession:
+    """模拟浏览器的会话管理器"""
+
+    def __init__(self, config: ScannerConfig, logger: logging.Logger):
+        self.config = config
+        self.logger = logger
+        self._session: Optional[requests.Session] = None
+        self._request_count = 0
+        self._last_request_time = 0.0
+
+    def _create_session(self) -> requests.Session:
+        """创建带有完整浏览器模拟的会话"""
+        session = requests.Session()
+
+        # 配置重试策略
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["GET", "POST"]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+
+        # 禁用环境代理
+        session.trust_env = False
+
+        # 设置简化的浏览器请求头（避免压缩问题）
+        session.headers.update({
+            'Accept': '*/*',
+            'Accept-Language': 'zh-CN,zh;q=0.9',
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+            'Referer': 'https://quote.eastmoney.com/',
+        })
+
+        # 设置Cookie
+        if self.config.cookie:
+            session.headers['Cookie'] = self.config.cookie
+
+        return session
+
+    def get_session(self) -> requests.Session:
+        """获取或创建会话"""
+        if self._session is None:
+            self._session = self._create_session()
+        return self._session
+
+    def request_with_delay(self, url: str, **kwargs) -> Optional[requests.Response]:
+        """带智能延迟的请求"""
+        session = self.get_session()
+
+        # 计算动态延迟
+        base_delay = self.config.request_delay
+        jitter = random.uniform(0, self.config.request_delay_jitter)
+        delay = base_delay + jitter
+
+        # 如果请求过于频繁，增加额外延迟
+        current_time = time.time()
+        time_since_last = current_time - self._last_request_time
+        if time_since_last < delay:
+            extra_delay = delay - time_since_last
+            time.sleep(extra_delay)
+
+        try:
+            response = session.get(url, timeout=self.config.request_timeout, **kwargs)
+            self._request_count += 1
+            self._last_request_time = time.time()
+            return response
+        except requests.RequestException as e:
+            self.logger.warning(f"请求失败: {str(e)[:50]}")
+            return None
+
+    def close(self):
+        """关闭会话"""
+        if self._session:
+            self._session.close()
+            self._session = None
+
+
 class WyckoffScanner:
     """威科夫扫描器"""
 
@@ -551,12 +640,14 @@ class WyckoffScanner:
         self.cache = DataCache(self.config.cache_dir, self.config.cache_ttl_hours)
         self.wyckoff_analyzer = WyckoffAnalyzer(self.config)
         self.vp_analyzer = VolumePriceAnalyzer(self.config)
+        self.browser = BrowserSession(self.config, self.logger)
         self._cache_hits = 0
         self._cache_misses = 0
         self._index_strength: float = 0.0
 
     def close(self):
         """关闭资源"""
+        self.browser.close()
         stats = self.cache.get_stats()
         self.logger.info(f"缓存统计: 内存{stats['memory_entries']}条, "
                          f"磁盘{stats['disk_entries']}条, "
@@ -564,56 +655,46 @@ class WyckoffScanner:
         self.logger.info(f"缓存命中: {self._cache_hits}, 未命中: {self._cache_misses}")
 
     def _api_get(self, url: str, use_cache: bool = True) -> Optional[Dict[str, Any]]:
-        """HTTP GET请求（使用curl）"""
+        """HTTP GET请求"""
+        cache_key = self._generate_cache_key(url)
+
         if use_cache and self.config.cache_enabled:
-            cached = self.cache.get(url)
+            cached = self.cache.get(cache_key)
             if cached is not None:
                 self._cache_hits += 1
                 return cached
 
         self._cache_misses += 1
 
-        # 使用完整的请求头（包含完整Cookie）
-        cmd = [
-            'curl', '-s', '-4', '--noproxy', '*',
-            '--connect-timeout', '10',
-            '--max-time', str(self.config.request_timeout),
-            '-H', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-            '-H', 'Accept-Language: zh-CN,zh;q=0.9,en;q=0.8,zh-TW;q=0.7',
-            '-H', 'Cache-Control: no-cache',
-            '-H', 'Connection: keep-alive',
-            '-H', 'Pragma: no-cache',
-            '-H', 'Sec-Fetch-Dest: document',
-            '-H', 'Sec-Fetch-Mode: navigate',
-            '-H', 'Sec-Fetch-Site: none',
-            '-H', 'Sec-Fetch-User: ?1',
-            '-H', 'Upgrade-Insecure-Requests: 1',
-            '-H', 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
-            '-H', 'sec-ch-ua: "Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
-            '-H', 'sec-ch-ua-mobile: ?0',
-            '-H', 'sec-ch-ua-platform: "macOS"',
-            '-b', 'qgqp_b_id=a6b7fdc2e7b5a497eecbd5479ac66387; st_nvi=aYp2wao6rDuXgKbmQtXl06598; nid18=0eb72bca22228cd120cafad64c39bd30; nid18_create_time=1769561614569; gviem=ruYA8TSFZ9EYgNC1gOYZyfe35; gviem_create_time=1769561614569; fullscreengg=1; fullscreengg2=1; st_si=93488908361421; st_pvi=50071006060836; st_sp=2025-09-29%2013%3A55%3A42; st_inirUrl=https%3A%2F%2Fwww.baidu.com%2F; st_sn=61; st_psi=20260327165916989-113104312931-4149617526; st_asi=delete',
-            '--compressed',
-            url
-        ]
+        response = self.browser.request_with_delay(url)
+        if response is None:
+            return None
+
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True,
-                                    timeout=self.config.request_timeout + 5)
-            if result.returncode == 0 and result.stdout:
-                data = json.loads(result.stdout)
+            if response.status_code == 200:
+                data = response.json()
                 if use_cache and self.config.cache_enabled:
-                    self.cache.set(url, data)
+                    self.cache.set(cache_key, data)
                 return data
             else:
-                err_msg = result.stderr[:50] if result.stderr else 'empty response'
-                self.logger.debug(f"curl返回空: {err_msg}")
-        except subprocess.TimeoutExpired:
-            self.logger.warning(f"请求超时: {url[:60]}...")
+                self.logger.warning(f"HTTP {response.status_code}: {url[:80]}...")
         except json.JSONDecodeError as e:
             self.logger.error(f"JSON解析错误: {str(e)[:50]}")
-        except Exception as e:
-            self.logger.warning(f"请求错误: {str(e)[:50]}")
+
         return None
+
+    def _generate_cache_key(self, url: str) -> str:
+        """生成缓存键"""
+        if 'secid=' in url:
+            secid_match = re.search(r'secid=(\d+\.\d+)', url)
+            klt_match = re.search(r'klt=(\d+)', url)
+            if secid_match and klt_match:
+                return f"kline_{secid_match.group(1)}_{klt_match.group(1)}"
+        elif 'clist' in url:
+            pn_match = re.search(r'pn=(\d+)', url)
+            if pn_match:
+                return f"stocklist_p{pn_match.group(1)}"
+        return hashlib.md5(url.encode()).hexdigest()
 
     def get_index_strength(self) -> float:
         """获取大盘强度"""
@@ -681,7 +762,6 @@ class WyckoffScanner:
             if stocks:
                 self.logger.info(f"第{page}页: +{len(stocks)}只，累计{len(all_stocks) + len(stocks)}只")
             all_stocks.extend(stocks)
-            time.sleep(0.1)
 
         self.logger.info(f"共筛选出 {len(all_stocks)} 只候选股票")
         return all_stocks
@@ -759,20 +839,19 @@ class WyckoffScanner:
             return None
 
         pe = stock.pe
-        if isinstance(pe, (int, float)) and (pe < 0 or pe > self.config.max_pe):
-            return {'reason': f'PE={pe}'}
+        if isinstance(pe, (int, float)):
+            if not self.config.allow_negative_pe and pe < 0:
+                return {'reason': f'PE={pe}(负值)'}
+            if pe > self.config.max_pe:
+                return {'reason': f'PE={pe}(>{self.config.max_pe})'}
 
         opens, highs, lows, closes, volumes = VectorizedIndicators.extract_arrays(klines)
         if highs is None:
             return None
 
-        # 威科夫结构分析
         structure = self.wyckoff_analyzer.analyze_structure(klines, highs, lows, closes, volumes)
-
-        # 量价分析
         vp_analysis = self.vp_analyzer.analyze(closes, volumes)
 
-        # ATR
         atr = VectorizedIndicators.calculate_atr(highs, lows, closes, 20)
         if atr is None:
             return {'reason': 'ATR不足'}
@@ -782,7 +861,6 @@ class WyckoffScanner:
         if atr_pct < self.config.atr_min or atr_pct > self.config.atr_max:
             return {'reason': f'ATR={atr_pct:.1f}%'}
 
-        # 底部结构验证
         recent_lows = lows[-30:]
         min_low = float(np.min(recent_lows))
         min_idx = int(np.argmin(recent_lows))
@@ -791,17 +869,14 @@ class WyckoffScanner:
         if min_days_ago < 3:
             return {'reason': f'最低点仅{min_days_ago}天前'}
 
-        # 破位检查
         if min_idx < 29:
             subsequent_lows = recent_lows[min_idx + 1:]
             if np.any(subsequent_lows < min_low * 0.98):
                 return {'reason': '破位'}
 
-        # 阻力位和均量
         resistance = VectorizedIndicators.calculate_resistance(highs, 20, 0.96)
         avg_vol = VectorizedIndicators.calculate_avg_volume(volumes, 20)
 
-        # 检查SOS信号
         for i in range(3):
             idx = -3 + i
             change_pct = klines[idx]['change_pct']
@@ -849,7 +924,6 @@ class WyckoffScanner:
 
     def analyze_stock(self, stock: StockInfo, index_strength: float) -> Optional[SOSSignal]:
         """分析单只股票"""
-        time.sleep(self.config.request_delay)
         try:
             klines = self.get_kline_data(stock)
             if klines and len(klines) >= 30:
@@ -892,12 +966,11 @@ class WyckoffScanner:
             self.logger.info(f"已清理 {cleared} 个过期缓存")
 
         self.logger.info("=" * 60)
-        self.logger.info("威科夫SOS扫描 V5 (curl + ThreadPoolExecutor)")
+        self.logger.info("威科夫SOS扫描 V6 (requests.Session 浏览器模拟)")
         self.logger.info(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         self.logger.info(f"并发数: {self.config.max_workers}")
         self.logger.info("=" * 60)
 
-        # 获取大盘强度
         index_strength = self.get_index_strength()
         self.logger.info(f"大盘强度(沪深300): {index_strength:+.2f}%")
 
@@ -934,7 +1007,6 @@ class WyckoffScanner:
                 if completed % 50 == 0:
                     self.logger.info(f"  进度: {completed}/{len(stocks)}，发现 {len(results)} 个信号")
 
-        # 按总分排序
         results.sort(key=lambda x: x.total_score, reverse=True)
         elapsed = time.time() - start_time
         self.logger.info(f"扫描完成: {len(stocks)}只候选，{len(results)}个SOS信号，耗时{elapsed:.1f}秒")
@@ -972,7 +1044,6 @@ class WyckoffScanner:
                   f"{r.signal_type:<8} {r.volume_ratio:<6.1f} {r.wyckoff_phase:<12} "
                   f"{r.quality:<12} {r.total_score:<6.1f}")
 
-        # 统计
         a_count = sum(1 for r in results if r.quality == SignalQuality.A.value)
         b_count = sum(1 for r in results if r.quality == SignalQuality.B.value)
         c_count = sum(1 for r in results if r.quality == SignalQuality.C.value)
