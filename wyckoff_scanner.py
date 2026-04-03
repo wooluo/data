@@ -58,27 +58,29 @@ def setup_logging(log_level: str = "INFO") -> logging.Logger:
 
 @dataclass
 class ScannerConfig:
-    """扫描器配置"""
+    """扫描器配置 - 优化版"""
     max_workers: int = 2
     request_delay: float = 0.8
     request_timeout: int = 15
     request_retries: int = 3
 
-    min_change_pct: float = 3.0
+    # 更严格的过滤条件
+    min_change_pct: float = 5.0      # 提高到5%
     min_price: float = 3.0
     max_price: float = 100.0
-    max_pe: float = 500.0
-    allow_negative_pe: bool = True
+    max_pe: float = 200.0      # 降低市盈率上限
+    allow_negative_pe: bool = False  # 排除负市盈率
 
-    sos_threshold: float = 0.6
-    min_volume_ratio: float = 1.5
+    # 更严格的SOS标准
+    min_volume_ratio: float = 2.5     # 提高到2.5倍
+    min_volume_ratio_weak: float = 2.0  # 弱市道中要求更高
+    structure_confirm_days: int = 5  # 结构确认天数
 
     cache_enabled: bool = True
     cache_ttl_hours: int = 8
 
     log_level: str = "INFO"
 
-    # 数据源优先级
     data_sources: List[str] = field(default_factory=lambda: ['ashare', 'sina', 'em'])
 
     def __post_init__(self):
@@ -99,10 +101,7 @@ class SOSSignal:
     volume_ratio: float
     quality: str
     score: float
-    atr: float = 0.0
-    obv: float = 0.0
     data_source: str = ""
-    ad_info: Dict = field(default_factory=dict)
 
 
 class DataCache:
@@ -445,13 +444,13 @@ class MultiSourceAPI:
 
 
 class WyckoffAnalyzer:
-    """威科夫分析器"""
+    """威科夫分析器 - 优化版"""
 
     def __init__(self, config: ScannerConfig):
         self.config = config
 
     def analyze(self, klines: List[Dict], index_strength: float) -> Optional[Dict]:
-        """分析K线数据"""
+        """分析K线数据 - 更严格的SOS标准"""
         if len(klines) < 60:
             return None
 
@@ -460,61 +459,114 @@ class WyckoffAnalyzer:
         highs = np.array([k['high'] for k in klines])
         lows = np.array([k['low'] for k in klines])
 
-        # 计算指标
-        sma20 = np.convolve(closes, np.ones(20)/20, mode='valid')
+        n = len(closes)
 
-        # 量比
+        # 量比计算
         today_volume = volumes[-1]
-        avg_volume = np.mean(volumes[-20:])
-        volume_ratio = today_volume / avg_volume if avg_volume > 0 else 1
+        avg_volume_20 = np.mean(volumes[-20:])
+        volume_ratio = today_volume / avg_volume_20 if avg_volume_20 > 0 else 1
 
-        # 涨幅
+        # 涨幅计算
         prev_close = closes[-2]
         change_pct = (closes[-1] - prev_close) / prev_close * 100
 
-        # SOS信号判断
-        is_sos = False
+        # 根据大盘强度调整阈值
+        is_weak_market = index_strength < -0.3
 
-        # 1. 放量突破
+        # 结构确认：检测前期支撑测试
+        has_support_test = self._check_support_structure(closes, lows, volumes)
+
+        # SOS信号判断 - 更严格
+        is_sos = False
+        signal_reason = []
+
+        # 1. 显著放量突破 (量比>=2.5， 突破前高)
         if volume_ratio >= self.config.min_volume_ratio:
             if closes[-1] > highs[-2]:
                 is_sos = True
+                signal_reason.append(f"放量{volume_ratio:.1f}倍突破")
 
-        # 2. 突破均线
-        if closes[-1] > sma20[-1] and volume_ratio > 1:
-            is_sos = True
-
-        # 3. 相对强度
-        if change_pct > 0 and index_strength < 0:
-            if volume_ratio >= 1.5:
+        # 2. 弱市道中的强势股 (大盘跌，个股涨，量比>=2.0)
+        if is_weak_market and change_pct > 3:
+            if volume_ratio >= self.config.min_volume_ratio_weak and has_support_test:
                 is_sos = True
+                signal_reason.append(f"弱市强势(大盘{index_strength:.1f}%)")
+
+        # 3. 突破20日均线 + 结构确认
+        sma20 = np.convolve(closes, np.ones(20)/20, mode='valid')
+        if len(sma20) > 0 and closes[-1] > sma20[-1]:
+            if volume_ratio >= 2.0 and has_support_test:
+                is_sos = True
+                signal_reason.append("突破MA20+结构确认")
 
         if not is_sos:
             return None
 
-        # 计算分数
-        score = 50
+        # 计算分数 - 更严格
+        score = 40  # 基础分降低
 
-        if volume_ratio >= 3:
+        # 量比评分 (更严格)
+        if volume_ratio >= 5:
+            score += 20
+        elif volume_ratio >= 3:
             score += 15
-        elif volume_ratio >= 2:
+        elif volume_ratio >= 2.5:
             score += 10
 
-        if change_pct >= 10:
+        # 涨幅评分
+        if change_pct >= 9.9:  # 涨停
+            score += 15
+        elif change_pct >= 7:
             score += 10
         elif change_pct >= 5:
             score += 5
 
-        if change_pct > 0 and index_strength < -0.5:
+        # 相对强度加分
+        if is_weak_market and change_pct > 5:
+            score += 15
+        elif change_pct > 0 and index_strength < -0.5:
             score += 10
+
+        # 结构确认加分
+        if has_support_test:
+            score += 10
+
+        # 更严格的A级标准
+        quality = 'C'
+        if score >= 75 and volume_ratio >= 2.5 and change_pct >= 5:
+            quality = 'A'
+        elif score >= 60 and volume_ratio >= 2.0:
+            quality = 'B'
 
         return {
             'is_sos': True,
             'volume_ratio': round(volume_ratio, 1),
             'change_pct': round(change_pct, 2),
             'score': min(100, score),
-            'quality': 'A' if score >= 70 else ('B' if score >= 50 else 'C')
+            'quality': quality,
+            'signal_reason': ', '.join(signal_reason),
+            'support_confirmed': has_support_test,
         }
+
+    def _check_support_structure(self, closes: np.ndarray, lows: np.ndarray, volumes: np.ndarray) -> bool:
+        """检测前期支撑结构"""
+        if len(closes) < 20:
+            return False
+
+        # 检查过去5-20天内是否有支撑测试
+        recent_lows = lows[-20:-2]
+        recent_closes = closes[-20:-2]
+        recent_volumes = volumes[-20:-2]
+
+        # 寻找低位支撑测试（下探后回升）
+        support_tests = 0
+        for i in range(1, len(recent_lows)):
+            # 当天最低价接近前低，但收盘价高于前收（支撑有效）
+            if recent_lows[i] <= recent_lows[i-1] * 1.02:
+                if recent_closes[i] > recent_closes[i-1]:
+                    support_tests += 1
+
+        return support_tests >= 2  # 至少2次支撑测试
 
 
 class WyckoffScanner:
@@ -571,15 +623,16 @@ class WyckoffScanner:
                         change_pct=stock['change_pct'],
                         volume=stock['volume'],
                         amount=stock['amount'],
-                        signal_type='连续突破' if stock['change_pct'] > 5 else '单日突破',
-                        structure='强势信号' if analysis['score'] >= 70 else '初级支撑',
+                        signal_type=analysis.get('signal_reason', 'SOS信号'),
+                        structure='结构确认' if analysis.get('support_confirmed') else '待确认',
                         volume_ratio=analysis['volume_ratio'],
                         quality=analysis['quality'],
                         score=analysis['score'],
                         data_source=kline_source,
                     )
                     results.append(signal)
-                    self.logger.info(f"  ★ {signal.name}({signal.code}) {signal.signal_type} {signal.change_pct:+.1f}% 量比{signal.volume_ratio:.1f} [{signal.quality}级][{kline_source}]")
+                    support_mark = "✓" if analysis.get('support_confirmed') else ""
+                    self.logger.info(f"  ★ {signal.name}({signal.code}) {signal.change_pct:+.1f}% 量比{signal.volume_ratio:.1f} [{signal.quality}级]{support_mark}[{kline_source}]")
 
             count += 1
             if count % 50 == 0:
